@@ -93,17 +93,20 @@ struct ReaderView: View {
     }
 
     private func exportAudio() {
+        let isVoicebox = (player.engineKind == .voicebox)
+        let fileExtension = isVoicebox ? "wav" : "caf"
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "caf") ?? .audio]
-        panel.nameFieldStringValue = document.title + ".caf"
+        panel.allowedContentTypes = [
+            (isVoicebox ? UTType.wav : UTType(filenameExtension: "caf")) ?? .audio
+        ]
+        panel.nameFieldStringValue = document.title + "." + fileExtension
         panel.title = "Export Narration Audio"
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
             isExporting = true
             AudioExporter.export(
                 text: text,
-                voiceIdentifier: player.voiceIdentifier,
-                speedMultiplier: player.speedMultiplier,
+                using: player,
                 to: url
             ) { result in
                 isExporting = false

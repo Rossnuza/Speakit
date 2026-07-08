@@ -41,6 +41,17 @@ final class AppState: ObservableObject {
                           : self.dictationHUD.hide()
             }
             .store(in: &cancellables)
+
+        // Surface engine failures (e.g. Voicebox app not running) in the
+        // main window's alert.
+        player.$playbackError
+            .receive(on: DispatchQueue.main)
+            .compactMap { $0 }
+            .sink { [weak self] message in
+                self?.lastError = message
+                self?.player.playbackError = nil
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Actions

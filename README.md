@@ -13,7 +13,8 @@ no network services required (web-page import fetches the page you ask for, noth
 |---|---|
 | Listen to PDFs, docs, books, articles | Import **PDF, DOCX, DOC, RTF, ODT, EPUB, HTML, TXT, Markdown**, any **web URL**, or **pasted text** into a persistent library |
 | Scan & listen (OCR) | Import **images** (PNG/JPEG/TIFF/HEIC/…) — text is recognized with the Vision framework |
-| 1,000+ voices, 60+ languages | Every speech voice installed on your Mac, grouped by language with **Standard / Enhanced / Premium** quality badges, searchable, with one-click preview. Download more in System Settings → Accessibility → Spoken Content |
+| Natural AI voices | **Voicebox AI engine**: if the free, open-source [Voicebox](https://voicebox.sh) app is installed, Speakit streams sentences through its local REST API — neural voices in 23 languages across 7 TTS engines (Qwen3-TTS, Chatterbox, Kokoro, …), plus **your own cloned voices**, all offline and unlimited |
+| 1,000+ voices, 60+ languages | Plus every Apple speech voice installed on your Mac, grouped by language with **Standard / Enhanced / Premium** quality badges, searchable, with one-click preview |
 | Listen up to 4.5× speed | Speed menu from **0.5× to 4.5×**, changeable live during playback |
 | Text highlighting that follows along | **Word-level highlight** plus a sentence wash, synchronized with speech and auto-scrolling; double-click anywhere to jump playback there |
 | Resume where you left off | Reading position and percent progress are saved per document |
@@ -53,10 +54,20 @@ Speakit asks for these the first time each feature is used:
 
 ### Getting better voices
 
-Speakit uses whatever system voices are installed. For dramatically more natural voices:
-System Settings → Accessibility → Spoken Content → System Voice → **Manage Voices…**, then
-download Enhanced/Premium voices in any of 60+ languages. They appear in Speakit's voice
-picker automatically.
+**Best quality — Voicebox AI voices (recommended):**
+
+1. Install [Voicebox](https://voicebox.sh) (free, open source, no account needed)
+2. Launch it and make sure its **API server** is enabled (gear icon in Voicebox; it serves
+   `http://127.0.0.1:17493` — Speakit's Settings → AI Voices has a **Test Connection** button)
+3. In Speakit, open the voice menu in the player bar and switch to the **Voicebox AI** tab,
+   then pick (or preview) any profile — including voices you've cloned in Voicebox
+
+Speakit renders each sentence through Voicebox just-in-time and prefetches the next one, so
+playback is continuous; speed changes (0.5×–4.5×) are applied with pitch correction.
+
+**System voices:** System Settings → Accessibility → Spoken Content → System Voice →
+**Manage Voices…**, then download Enhanced/Premium voices in any of 60+ languages. They
+appear in Speakit's voice picker automatically.
 
 ## Keyboard shortcuts
 
@@ -75,8 +86,12 @@ Sources/Speakit/
 │   ├── Document.swift        # Library item metadata
 │   └── LibraryStore.swift    # JSON index + per-document text files on disk
 ├── Services/
-│   ├── SpeechPlayer.swift    # AVSpeechSynthesizer engine: sentence-chunked playback,
-│   │                         #   word highlighting, speed mapping, seek/skip, resume
+│   ├── SpeechPlayer.swift    # Engine-agnostic orchestrator: sentence-chunked playback,
+│   │                         #   highlighting, speed mapping, seek/skip, resume
+│   ├── SpeechEngine.swift    # Engine protocol + SystemSpeechEngine (AVSpeechSynthesizer)
+│   ├── VoiceboxClient.swift  # REST client for the local Voicebox API (port 17493)
+│   ├── VoiceboxSpeechEngine.swift # AI narration: /generate → WAV → AVAudioPlayerNode
+│   │                         #   → AVAudioUnitTimePitch, prefetching, timed highlights
 │   ├── TextExtractor.swift   # PDFKit, NSAttributedString importers, EPUB unzip,
 │   │                         #   web fetch + readability strip, Vision OCR
 │   ├── DictationService.swift# SFSpeechRecognizer + AVAudioEngine voice typing,

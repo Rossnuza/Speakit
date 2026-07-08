@@ -6,16 +6,22 @@ struct SettingsView: View {
     @ObservedObject var player: SpeechPlayer
     @ObservedObject var dictation: DictationService
 
+    @AppStorage("voiceboxBaseURL") private var voiceboxBaseURL = VoiceboxClient.defaultBaseURLString
+    @State private var voiceboxStatus: String?
+    @State private var isTestingVoicebox = false
+
     var body: some View {
         TabView {
             playbackTab
                 .tabItem { Label("Playback", systemImage: "play.circle") }
+            aiVoicesTab
+                .tabItem { Label("AI Voices", systemImage: "sparkles") }
             dictationTab
                 .tabItem { Label("Voice Typing", systemImage: "mic") }
             shortcutsTab
                 .tabItem { Label("Shortcuts", systemImage: "keyboard") }
         }
-        .frame(width: 480, height: 340)
+        .frame(width: 500, height: 380)
     }
 
     // MARK: - Tabs
@@ -48,6 +54,63 @@ struct SettingsView: View {
                         .multilineTextAlignment(.trailing)
                 }
             }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+
+    private var aiVoicesTab: some View {
+        Form {
+            LabeledContent("Engine") {
+                Picker("", selection: $player.engineKind) {
+                    ForEach(TTSEngineKind.allCases) { kind in
+                        Text(kind.label).tag(kind)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 220)
+            }
+
+            TextField("Voicebox server", text: $voiceboxBaseURL, prompt: Text(VoiceboxClient.defaultBaseURLString))
+                .textFieldStyle(.roundedBorder)
+
+            LabeledContent("Connection") {
+                VStack(alignment: .trailing, spacing: 4) {
+                    Button {
+                        testVoicebox()
+                    } label: {
+                        if isTestingVoicebox {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Test Connection")
+                        }
+                    }
+                    .disabled(isTestingVoicebox)
+                    if let voiceboxStatus {
+                        Text(voiceboxStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+
+            Text("Voicebox (voicebox.sh) is a free, open-source AI voice studio that runs on this Mac — natural neural voices in 23 languages, plus voice cloning, with no accounts or fees. Launch the Voicebox app and enable its API server (gear icon), then pick an AI voice from the player bar's voice menu.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Link("Get Voicebox", destination: URL(string: "https://voicebox.sh")!)
+                Spacer()
+                if let docsURL = URL(string: voiceboxBaseURL.isEmpty
+                                     ? VoiceboxClient.defaultBaseURLString + "/docs"
+                                     : voiceboxBaseURL + "/docs") {
+                    Link("Local API Reference", destination: docsURL)
+                }
+            }
+            .font(.caption)
         }
         .formStyle(.grouped)
         .padding()
@@ -95,12 +158,25 @@ struct SettingsView: View {
     // MARK: - Helpers
 
     private var currentVoiceDescription: String {
-        if let id = player.voiceIdentifier,
-           let voice = AVSpeechSynthesisVoice(identifier: id) {
-            let language = Locale.current.localizedString(forIdentifier: voice.language) ?? voice.language
-            return "\(voice.name) (\(language))"
+        player.currentVoiceDisplayName
+            + (player.engineKind == .voicebox ? " (Voicebox AI)" : "")
+    }
+
+    private func testVoicebox() {
+        isTestingVoicebox = true
+        voiceboxStatus = nil
+        Task {
+            let result = await VoiceboxClient.shared.checkConnection()
+            await MainActor.run {
+                isTestingVoicebox = false
+                switch result {
+                case .success(let count):
+                    voiceboxStatus = "Connected — \(count) voice profile\(count == 1 ? "" : "s") available."
+                case .failure(let error):
+                    voiceboxStatus = error.localizedDescription
+                }
+            }
         }
-        return "System default"
     }
 
     private func shortcutBadge(_ keys: String) -> some View {

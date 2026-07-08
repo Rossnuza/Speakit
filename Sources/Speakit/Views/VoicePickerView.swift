@@ -1,10 +1,202 @@
 import SwiftUI
+import AppKit
 import AVFoundation
 
-/// Browses every speech voice installed on the Mac — hundreds across 60+
-/// languages, including Enhanced and Premium neural voices — with search
-/// and instant preview. More voices can be added in System Settings.
+/// Voice chooser with two engines:
+/// - **Voicebox AI** — natural neural voices (and clones) served by the
+///   open-source Voicebox app running locally on this Mac
+/// - **System** — every Apple speech voice installed, across 60+ languages
 struct VoicePickerView: View {
+    @ObservedObject var player: SpeechPlayer
+
+    @State private var selectedTab: TTSEngineKind
+
+    init(player: SpeechPlayer) {
+        self.player = player
+        _selectedTab = State(initialValue: player.engineKind)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Engine", selection: $selectedTab) {
+                ForEach(TTSEngineKind.allCases) { kind in
+                    Text(kind.label).tag(kind)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(10)
+
+            Divider()
+
+            switch selectedTab {
+            case .voicebox:
+                VoiceboxVoiceList(player: player)
+            case .system:
+                SystemVoiceList(player: player)
+            }
+        }
+        .frame(width: 360, height: 460)
+    }
+}
+
+// MARK: - Voicebox AI voices
+
+private struct VoiceboxVoiceList: View {
+    @ObservedObject var player: SpeechPlayer
+
+    @State private var profiles: [VoiceboxClient.Profile] = []
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+    @State private var previewingID: String?
+
+    /// Keeps the preview player alive while its clip plays.
+    @State private var previewPlayer: AVAudioPlayer?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if isLoading {
+                Spacer()
+                ProgressView("Contacting Voicebox…")
+                    .frame(maxWidth: .infinity)
+                Spacer()
+            } else if let errorMessage {
+                Spacer()
+                VStack(spacing: 10) {
+                    Image(systemName: "bolt.horizontal.circle")
+                        .font(.largeTitle)
+                        .foregroundStyle(.tertiary)
+                    Text("Voicebox isn't reachable")
+                        .font(.headline)
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                    Button("Try Again") { Task { await loadProfiles() } }
+                    Link("Get Voicebox (free, open source)",
+                         destination: URL(string: "https://voicebox.sh")!)
+                        .font(.caption)
+                }
+                .padding()
+                .frame(maxWidth: .infinity)
+                Spacer()
+            } else if profiles.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
+                    Text("No voice profiles yet")
+                        .font(.headline)
+                    Text("Create a voice profile in the Voicebox app (you can clone a voice from a few seconds of audio), then refresh.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    Button("Refresh") { Task { await loadProfiles() } }
+                }
+                .padding()
+                .frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                List {
+                    ForEach(profiles) { profile in
+                        profileRow(profile)
+                    }
+                }
+                .listStyle(.inset)
+            }
+
+            Divider()
+            HStack {
+                Text("AI voices run locally via Voicebox — free, offline, unlimited.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    Task { await loadProfiles() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Refresh voice profiles")
+            }
+            .padding(10)
+        }
+        .task { await loadProfiles() }
+    }
+
+    @ViewBuilder
+    private func profileRow(_ profile: VoiceboxClient.Profile) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(profile.name)
+                Text(subtitle(for: profile))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                preview(profile)
+            } label: {
+                if previewingID == profile.id {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "play.circle")
+                }
+            }
+            .buttonStyle(.borderless)
+            .help("Preview this voice")
+
+            if player.engineKind == .voicebox && player.voiceboxProfileID == profile.id {
+                Image(systemName: "checkmark")
+                    .foregroundStyle(.tint)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            player.selectVoiceboxProfile(id: profile.id, name: profile.name)
+        }
+    }
+
+    private func subtitle(for profile: VoiceboxClient.Profile) -> String {
+        var parts: [String] = ["Voicebox AI"]
+        if let engine = profile.engine { parts.append(engine) }
+        if let language = profile.language { parts.append(language) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func loadProfiles() async {
+        isLoading = true
+        errorMessage = nil
+        do {
+            profiles = try await VoiceboxClient.shared.fetchProfiles()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    private func preview(_ profile: VoiceboxClient.Profile) {
+        guard previewingID == nil else { return }
+        previewingID = profile.id
+        Task {
+            defer { previewingID = nil }
+            do {
+                let data = try await VoiceboxClient.shared.generate(
+                    text: "Hi, I'm \(profile.name). This is how I sound in Speakit.",
+                    profileID: profile.id
+                )
+                let audioPlayer = try AVAudioPlayer(data: data)
+                previewPlayer = audioPlayer
+                audioPlayer.play()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+// MARK: - System voices
+
+private struct SystemVoiceList: View {
     @ObservedObject var player: SpeechPlayer
 
     @State private var searchText = ""
@@ -74,7 +266,6 @@ struct VoicePickerView: View {
                 .foregroundStyle(.secondary)
                 .padding(10)
         }
-        .frame(width: 340, height: 420)
     }
 
     @ViewBuilder
@@ -95,13 +286,14 @@ struct VoicePickerView: View {
             .buttonStyle(.borderless)
             .help("Preview this voice")
 
-            if player.voiceIdentifier == voice.identifier {
+            if player.engineKind == .system && player.voiceIdentifier == voice.identifier {
                 Image(systemName: "checkmark")
                     .foregroundStyle(.tint)
             }
         }
         .contentShape(Rectangle())
         .onTapGesture {
+            player.engineKind = .system
             player.voiceIdentifier = voice.identifier
         }
     }

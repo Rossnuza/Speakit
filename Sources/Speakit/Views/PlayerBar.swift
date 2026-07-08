@@ -63,7 +63,8 @@ struct PlayerBar: View {
             Button {
                 showVoicePicker.toggle()
             } label: {
-                Label(currentVoiceName, systemImage: "person.wave.2")
+                Label(player.currentVoiceDisplayName,
+                      systemImage: player.engineKind == .voicebox ? "sparkles" : "person.wave.2")
                     .lineLimit(1)
             }
             .popover(isPresented: $showVoicePicker, arrowEdge: .top) {
@@ -98,14 +99,6 @@ struct PlayerBar: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.bar)
-    }
-
-    private var currentVoiceName: String {
-        if let id = player.voiceIdentifier,
-           let voice = AVSpeechSynthesisVoice(identifier: id) {
-            return voice.name
-        }
-        return "System Voice"
     }
 
     private var remainingLabel: String {

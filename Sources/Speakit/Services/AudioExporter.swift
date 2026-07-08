@@ -9,6 +9,7 @@ final class AudioExporter {
     enum ExportError: LocalizedError {
         case unsupportedBuffer
         case writeFailed(String)
+        case formatMismatch
 
         var errorDescription: String? {
             switch self {
@@ -16,8 +17,78 @@ final class AudioExporter {
                 return "The synthesizer produced audio in an unexpected format."
             case .writeFailed(let detail):
                 return "Could not write the audio file: \(detail)"
+            case .formatMismatch:
+                return "Voicebox returned clips in differing audio formats; try a different voice profile."
             }
         }
+    }
+
+    /// Routes to the engine the player is currently narrating with.
+    static func export(text: String,
+                       using player: SpeechPlayer,
+                       to destination: URL,
+                       completion: @escaping (Result<URL, Error>) -> Void) {
+        switch player.engineKind {
+        case .voicebox:
+            exportViaVoicebox(text: text,
+                              profileID: player.voiceboxProfileID,
+                              to: destination,
+                              completion: completion)
+        case .system:
+            export(text: text,
+                   voiceIdentifier: player.voiceIdentifier,
+                   speedMultiplier: player.speedMultiplier,
+                   to: destination,
+                   completion: completion)
+        }
+    }
+
+    /// Renders every sentence through the local Voicebox API and stitches
+    /// the clips into a single WAV file. Runs at natural (1x) speed.
+    static func exportViaVoicebox(text: String,
+                                  profileID: String?,
+                                  to destination: URL,
+                                  completion: @escaping (Result<URL, Error>) -> Void) {
+        let sentences = SpeechPlayer.sentenceRanges(in: text)
+        let ns = text as NSString
+        Task {
+            do {
+                try? FileManager.default.removeItem(at: destination)
+                var outputFile: AVAudioFile?
+                for range in sentences {
+                    let sentence = ns.substring(with: range)
+                    let data = try await VoiceboxClient.shared.generate(text: sentence, profileID: profileID)
+                    let buffer = try Self.pcmBuffer(from: data)
+                    if outputFile == nil {
+                        outputFile = try AVAudioFile(forWriting: destination,
+                                                     settings: buffer.format.settings)
+                    }
+                    guard outputFile?.processingFormat == buffer.format else {
+                        throw ExportError.formatMismatch
+                    }
+                    try outputFile?.write(from: buffer)
+                }
+                await MainActor.run { completion(.success(destination)) }
+            } catch {
+                await MainActor.run { completion(.failure(error)) }
+            }
+        }
+    }
+
+    private static func pcmBuffer(from data: Data) throws -> AVAudioPCMBuffer {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("speakit-export-\(UUID().uuidString).wav")
+        try data.write(to: tempURL)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let file = try AVAudioFile(forReading: tempURL)
+        let frameCount = AVAudioFrameCount(file.length)
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                            frameCapacity: frameCount) else {
+            throw ExportError.unsupportedBuffer
+        }
+        try file.read(into: buffer)
+        return buffer
     }
 
     /// Keeps in-flight exports alive until their completion fires.
