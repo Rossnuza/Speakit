@@ -30,7 +30,7 @@ final class VoiceboxClient {
         case badResponse(status: Int, body: String)
         case unrecognizedAudioPayload(String)
         case generationFailed(String)
-        case generationTimedOut
+        case generationTimedOut(String)
         case pollingUnsupported(String)
 
         var errorDescription: String? {
@@ -43,8 +43,8 @@ final class VoiceboxClient {
                 return "Voicebox replied, but the audio payload wasn't recognized (\(detail)). Check http://127.0.0.1:17493/docs for your version's API format."
             case .generationFailed(let reason):
                 return "Voicebox couldn't generate this audio: \(reason)"
-            case .generationTimedOut:
-                return "Voicebox is taking too long to render this audio. Large models can be slow on first use while they load — try again in a moment."
+            case .generationTimedOut(let trace):
+                return "Voicebox is taking too long to render this audio. Large models can be slow on first use while they load — try again in a moment. Recent API activity: \(trace)"
             case .pollingUnsupported(let detail):
                 return "Voicebox accepted the request but Speakit couldn't find its status endpoint to wait for the result (\(detail)). Check http://127.0.0.1:17493/docs and report the /generate flow shown there."
             }
@@ -70,6 +70,25 @@ final class VoiceboxClient {
     /// Set once POST /generate/stream 404s, so older servers skip
     /// straight to the job-based flow.
     private var streamUnsupported = false
+
+    /// Ring buffer of recent HTTP interactions, included in timeout
+    /// errors so problems are diagnosable from the error message alone.
+    private var requestTrace: [String] = []
+    private let traceLock = NSLock()
+
+    private func note(_ entry: String) {
+        traceLock.lock()
+        requestTrace.append(entry)
+        if requestTrace.count > 14 { requestTrace.removeFirst() }
+        traceLock.unlock()
+        NSLog("Speakit/Voicebox: \(entry)")
+    }
+
+    private func traceSummary() -> String {
+        traceLock.lock()
+        defer { traceLock.unlock() }
+        return requestTrace.joined(separator: " | ")
+    }
 
     /// How long to wait for a render before giving up. First-time model
     /// loads can take a while.
@@ -114,7 +133,7 @@ final class VoiceboxClient {
             return Profile(
                 id: id,
                 name: name ?? id,
-                engine: Self.string(dict, keys: ["engine", "model", "tts_engine", "provider"]),
+                engine: Self.string(dict, keys: ["default_engine", "engine", "tts_engine", "provider"]),
                 language: Self.string(dict, keys: ["language", "lang", "locale"])
             )
         }
@@ -130,7 +149,18 @@ final class VoiceboxClient {
     /// profile's engine, so we pass the profile's engine when known and
     /// self-correct from the server's error message when not.
     func generate(text: String, profileID: String?, engine: String? = nil) async throws -> Data {
-        let effectiveEngine = engine ?? profileID.flatMap { learnedEngines[$0] }
+        var effectiveEngine = engine ?? profileID.flatMap { learnedEngines[$0] }
+
+        // Selections saved without an engine (or by older Speakit builds)
+        // self-heal by looking the profile up once.
+        if effectiveEngine == nil, let profileID {
+            if let profile = try? await fetchProfiles().first(where: { $0.id == profileID }),
+               let profileEngine = profile.engine {
+                effectiveEngine = profileEngine
+                learnedEngines[profileID] = profileEngine
+            }
+        }
+
         do {
             return try await submitGeneration(text: text, profileID: profileID, engine: effectiveEngine)
         } catch ClientError.badResponse(let status, let body) {
@@ -159,8 +189,6 @@ final class VoiceboxClient {
                 } else {
                     throw ClientError.badResponse(status: status, body: bodyText)
                 }
-            } catch ClientError.unrecognizedAudioPayload {
-                streamUnsupported = true
             }
         }
 
@@ -209,8 +237,9 @@ final class VoiceboxClient {
 
         let contentType = (response as? HTTPURLResponse)?
             .value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
-        guard contentType.contains("audio") || Self.looksLikeAudio(data) else {
-            throw ClientError.unrecognizedAudioPayload("stream response was not audio")
+        guard Self.looksLikeAudio(data) || (contentType.contains("audio") && data.count > 200) else {
+            let bodyText = String(data: data.prefix(300), encoding: .utf8) ?? "\(data.count) bytes"
+            throw ClientError.generationFailed("the stream endpoint answered with: \(bodyText)")
         }
         return data
     }
@@ -249,14 +278,32 @@ final class VoiceboxClient {
     private func pollForAudio(jobID: String) async throws -> Data {
         let deadline = Date().addingTimeInterval(generationTimeout)
         let audioURL = baseURL.appendingPathComponent("audio").appendingPathComponent(jobID)
-        var attempt = 0
 
+        // Preferred: follow the server-sent-events status stream at
+        // GET /generate/{id}/status — it reports completed/failed (with
+        // the server's error text) the moment it happens.
+        do {
+            try await followStatusStream(jobID: jobID)
+            for _ in 0..<6 {
+                if let data = try? await fetchAudioData(from: audioURL), let data {
+                    return data
+                }
+                try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+            }
+        } catch let error as ClientError {
+            if case .generationFailed = error { throw error }
+            // Other client errors: fall through to dumb polling below.
+        } catch {
+            // SSE hiccup (unsupported endpoint, idle timeout…): fall back.
+            note("status stream failed: \(error.localizedDescription)")
+        }
+
+        // Fallback: poll GET /audio/{generation_id} until it exists.
+        var attempt = 0
         while Date() < deadline {
             try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
             attempt += 1
 
-            // GET /audio/{generation_id} serves the finished file; while
-            // the job is still rendering it simply isn't there yet.
             if let data = try? await fetchAudioData(from: audioURL), let data {
                 return data
             }
@@ -272,7 +319,47 @@ final class VoiceboxClient {
                 }
             }
         }
-        throw ClientError.generationTimedOut
+        throw ClientError.generationTimedOut(traceSummary())
+    }
+
+    /// Reads the SSE stream at GET /generate/{id}/status until the
+    /// generation completes (returns) or fails (throws generationFailed).
+    private func followStatusStream(jobID: String) async throws {
+        let url = baseURL.appendingPathComponent("generate")
+            .appendingPathComponent(jobID)
+            .appendingPathComponent("status")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = generationTimeout
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            note("GET \(url.path) → \(status) (status stream unavailable)")
+            throw ClientError.badResponse(status: status, body: "status stream unavailable")
+        }
+        note("GET \(url.path) → SSE open")
+
+        for try await line in bytes.lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("data:") else { continue }
+            let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard let event = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] else {
+                continue
+            }
+            let status = (Self.string(event, keys: ["status", "state"]) ?? "").lowercased()
+            if status.contains("fail") || status.contains("error") || status.contains("cancel") {
+                let reason = Self.string(event, keys: ["error", "detail", "message"]) ?? "status was “\(status)”"
+                note("SSE status: \(status) — \(reason)")
+                throw ClientError.generationFailed(reason)
+            }
+            if status.contains("complet") || status.contains("done") || status.contains("succe") {
+                note("SSE status: \(status)")
+                return
+            }
+        }
+        // Stream ended without a terminal status; let the audio fetch decide.
+        note("SSE stream ended")
     }
 
     /// Fetches the generation record by id, discovering which endpoint
@@ -488,9 +575,21 @@ final class VoiceboxClient {
     }
 
     private func dataOrThrow(for request: URLRequest) async throws -> (Data, URLResponse) {
+        let method = request.httpMethod ?? "GET"
+        let path = request.url?.path ?? "?"
         do {
-            return try await session.data(for: request)
+            let (data, response) = try await session.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            var entry = "\(method) \(path) → \(status), \(data.count)B"
+            if !Self.looksLikeAudio(data), status >= 300 || data.count < 600,
+               let text = String(data: data.prefix(160), encoding: .utf8),
+               !text.isEmpty {
+                entry += " “\(text.replacingOccurrences(of: "\n", with: " "))”"
+            }
+            note(entry)
+            return (data, response)
         } catch {
+            note("\(method) \(path) → transport error: \(error.localizedDescription)")
             throw ClientError.serverUnreachable(error.localizedDescription)
         }
     }
