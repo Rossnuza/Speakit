@@ -67,6 +67,10 @@ final class VoiceboxClient {
     /// keyed by profile id, so we only pay the failed round-trip once.
     private var learnedEngines: [String: String] = [:]
 
+    /// Set once POST /generate/stream 404s, so older servers skip
+    /// straight to the job-based flow.
+    private var streamUnsupported = false
+
     /// How long to wait for a render before giving up. First-time model
     /// loads can take a while.
     private let generationTimeout: TimeInterval = 300
@@ -142,53 +146,84 @@ final class VoiceboxClient {
     }
 
     private func submitGeneration(text: String, profileID: String?, engine: String?) async throws -> Data {
-        let url = baseURL.appendingPathComponent("generate")
-        var request = URLRequest(url: url)
+        let body = Self.requestBody(text: text, profileID: profileID, engine: engine)
+
+        // Preferred: POST /generate/stream returns the WAV directly —
+        // no polling, and nothing added to the user's Voicebox history.
+        if !streamUnsupported {
+            do {
+                return try await postForAudio(path: "generate/stream", body: body)
+            } catch ClientError.badResponse(let status, let bodyText) {
+                if status == 404 || status == 405 {
+                    streamUnsupported = true // older server; use the job flow
+                } else {
+                    throw ClientError.badResponse(status: status, body: bodyText)
+                }
+            } catch ClientError.unrecognizedAudioPayload {
+                streamUnsupported = true
+            }
+        }
+
+        // Fallback: POST /generate creates a job; the finished audio is
+        // served at GET /audio/{generation_id}.
+        var request = URLRequest(url: baseURL.appendingPathComponent("generate"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("speakit", forHTTPHeaderField: "X-Voicebox-Client-Id")
-
-        // FastAPI-style servers ignore unknown fields, so we send the
-        // profile under the common spellings to be version-proof.
-        var body: [String: Any] = ["text": text]
-        if let profileID {
-            body["profile_id"] = profileID
-            body["profileId"] = profileID
-            body["profile"] = profileID
-        }
-        if let engine, !engine.isEmpty {
-            body["engine"] = engine
-        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await dataOrThrow(for: request)
         try Self.checkHTTP(response, data: data)
 
-        // Some versions return the audio straight away.
-        let contentType = (response as? HTTPURLResponse)?
-            .value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
-        if contentType.contains("audio") || Self.looksLikeAudio(data) {
+        if Self.looksLikeAudio(data) {
             return data
         }
-
         guard let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ClientError.unrecognizedAudioPayload("neither audio bytes nor JSON")
         }
-
-        // Audio may already be embedded or linked in the first response.
         if let failure = Self.failureMessage(in: record) {
             throw ClientError.generationFailed(failure)
         }
         if let audio = try await resolveAudio(in: record) {
             return audio
         }
-
-        // Job-based flow: poll the generation record until it finishes.
         guard let jobID = Self.string(record, keys: ["id", "generation_id", "generationId", "job_id", "jobId"]) else {
             let keys = record.keys.sorted().joined(separator: ", ")
             throw ClientError.unrecognizedAudioPayload("JSON keys: \(keys)")
         }
         return try await pollForAudio(jobID: jobID)
+    }
+
+    /// POSTs a generation request to an endpoint that answers with raw
+    /// audio bytes (the /generate/stream route).
+    private func postForAudio(path: String, body: [String: Any]) async throws -> Data {
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("speakit", forHTTPHeaderField: "X-Voicebox-Client-Id")
+        request.timeoutInterval = generationTimeout
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await dataOrThrow(for: request)
+        try Self.checkHTTP(response, data: data)
+
+        let contentType = (response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        guard contentType.contains("audio") || Self.looksLikeAudio(data) else {
+            throw ClientError.unrecognizedAudioPayload("stream response was not audio")
+        }
+        return data
+    }
+
+    private static func requestBody(text: String, profileID: String?, engine: String?) -> [String: Any] {
+        var body: [String: Any] = ["text": text]
+        if let profileID {
+            body["profile_id"] = profileID
+        }
+        if let engine, !engine.isEmpty {
+            body["engine"] = engine
+        }
+        return body
     }
 
     /// Quick health check used by Settings and the voice picker.
@@ -213,25 +248,28 @@ final class VoiceboxClient {
 
     private func pollForAudio(jobID: String) async throws -> Data {
         let deadline = Date().addingTimeInterval(generationTimeout)
-        var consecutiveLookupFailures = 0
+        let audioURL = baseURL.appendingPathComponent("audio").appendingPathComponent(jobID)
+        var attempt = 0
 
         while Date() < deadline {
             try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+            attempt += 1
 
-            guard let record = try await fetchGenerationRecord(id: jobID) else {
-                consecutiveLookupFailures += 1
-                if consecutiveLookupFailures >= 6 {
-                    throw ClientError.pollingUnsupported("no status endpoint answered for generation \(jobID)")
+            // GET /audio/{generation_id} serves the finished file; while
+            // the job is still rendering it simply isn't there yet.
+            if let data = try? await fetchAudioData(from: audioURL), let data {
+                return data
+            }
+
+            // Every few attempts, look up the record itself so a failed
+            // generation aborts promptly instead of waiting for timeout.
+            if attempt % 6 == 0, let record = try? await fetchGenerationRecord(id: jobID), let record {
+                if let failure = Self.failureMessage(in: record) {
+                    throw ClientError.generationFailed(failure)
                 }
-                continue
-            }
-            consecutiveLookupFailures = 0
-
-            if let failure = Self.failureMessage(in: record) {
-                throw ClientError.generationFailed(failure)
-            }
-            if let audio = try await resolveAudio(in: record) {
-                return audio
+                if let audio = try await resolveAudio(in: record) {
+                    return audio
+                }
             }
         }
         throw ClientError.generationTimedOut
@@ -304,6 +342,26 @@ final class VoiceboxClient {
         for location in audioLocations(in: record) {
             if let data = try await fetchAudio(atLocation: location) {
                 return data
+            }
+        }
+
+        // Voicebox serves finished audio at /audio/{generation_id} and
+        // /audio/version/{version_id}.
+        if let generationID = Self.string(record, keys: ["id", "generation_id", "generationId"]) {
+            let url = baseURL.appendingPathComponent("audio").appendingPathComponent(generationID)
+            if let data = try? await fetchAudioData(from: url), let data {
+                return data
+            }
+        }
+        if let versions = record["versions"] as? [[String: Any]] {
+            for version in versions.reversed() {
+                guard let versionID = Self.string(version, keys: ["id", "version_id", "versionId"]) else { continue }
+                let url = baseURL.appendingPathComponent("audio")
+                    .appendingPathComponent("version")
+                    .appendingPathComponent(versionID)
+                if let data = try? await fetchAudioData(from: url), let data {
+                    return data
+                }
             }
         }
         return nil
