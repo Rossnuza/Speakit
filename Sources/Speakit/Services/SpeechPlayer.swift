@@ -72,6 +72,9 @@ final class SpeechPlayer: NSObject, ObservableObject {
     /// Selected Voicebox profile (AI voice).
     @Published private(set) var voiceboxProfileID: String?
     @Published private(set) var voiceboxProfileName: String?
+    /// TTS engine the selected profile runs on (kokoro, qwen, …); Voicebox
+    /// rejects requests whose engine doesn't match the profile's.
+    @Published private(set) var voiceboxProfileEngine: String?
 
     /// Called whenever the sentence index advances, so the app can persist
     /// the reading position. Arguments: document id, character offset.
@@ -104,11 +107,13 @@ final class SpeechPlayer: NSObject, ObservableObject {
             .flatMap(TTSEngineKind.init(rawValue:)) ?? .system
         self.voiceboxProfileID = UserDefaults.standard.string(forKey: "voiceboxProfileID")
         self.voiceboxProfileName = UserDefaults.standard.string(forKey: "voiceboxProfileName")
+        self.voiceboxProfileEngine = UserDefaults.standard.string(forKey: "voiceboxProfileEngine")
         super.init()
         systemEngine.delegate = self
         voiceboxEngine.delegate = self
         systemEngine.voiceIdentifier = voiceIdentifier
         voiceboxEngine.profileID = voiceboxProfileID
+        voiceboxEngine.profileEngine = voiceboxProfileEngine
     }
 
     var hasContent: Bool { !sentences.isEmpty }
@@ -147,12 +152,15 @@ final class SpeechPlayer: NSObject, ObservableObject {
     // MARK: - Voice selection
 
     /// Switches narration to a Voicebox AI voice.
-    func selectVoiceboxProfile(id: String, name: String) {
+    func selectVoiceboxProfile(id: String, name: String, engine: String?) {
         voiceboxProfileID = id
         voiceboxProfileName = name
+        voiceboxProfileEngine = engine
         UserDefaults.standard.set(id, forKey: "voiceboxProfileID")
         UserDefaults.standard.set(name, forKey: "voiceboxProfileName")
+        UserDefaults.standard.set(engine, forKey: "voiceboxProfileEngine")
         voiceboxEngine.profileID = id
+        voiceboxEngine.profileEngine = engine
         if engineKind == .voicebox {
             restartCurrentSentenceIfSpeaking()
         } else {

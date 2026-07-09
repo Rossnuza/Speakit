@@ -16,6 +16,9 @@ final class VoiceboxSpeechEngine: SpeechEngine {
 
     /// Voicebox profile (voice) to render with.
     var profileID: String?
+    /// TTS engine the profile runs on (kokoro, qwen, …), sent with each
+    /// request because Voicebox validates the pairing.
+    var profileEngine: String?
 
     private let audioEngine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
@@ -63,9 +66,10 @@ final class VoiceboxSpeechEngine: SpeechEngine {
         }
 
         let profile = profileID
+        let engine = profileEngine
         Task { [weak self] in
             do {
-                let data = try await VoiceboxClient.shared.generate(text: sentence, profileID: profile)
+                let data = try await VoiceboxClient.shared.generate(text: sentence, profileID: profile, engine: engine)
                 await MainActor.run {
                     guard let self, self.generation == gen else { return }
                     self.cache.setObject(data as NSData, forKey: self.cacheKey(for: sentence))
@@ -87,8 +91,9 @@ final class VoiceboxSpeechEngine: SpeechEngine {
         inFlightPrefetches.insert(key as String)
 
         let profile = profileID
+        let engine = profileEngine
         Task { [weak self] in
-            let data = try? await VoiceboxClient.shared.generate(text: sentence, profileID: profile)
+            let data = try? await VoiceboxClient.shared.generate(text: sentence, profileID: profile, engine: engine)
             await MainActor.run {
                 guard let self else { return }
                 self.inFlightPrefetches.remove(key as String)

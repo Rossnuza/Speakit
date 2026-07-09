@@ -152,7 +152,7 @@ private struct VoiceboxVoiceList: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            player.selectVoiceboxProfile(id: profile.id, name: profile.name)
+            player.selectVoiceboxProfile(id: profile.id, name: profile.name, engine: profile.engine)
         }
     }
 
@@ -182,7 +182,8 @@ private struct VoiceboxVoiceList: View {
             do {
                 let data = try await VoiceboxClient.shared.generate(
                     text: "Hi, I'm \(profile.name). This is how I sound in Speakit.",
-                    profileID: profile.id
+                    profileID: profile.id,
+                    engine: profile.engine
                 )
                 let audioPlayer = try AVAudioPlayer(data: data)
                 previewPlayer = audioPlayer

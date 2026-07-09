@@ -63,6 +63,10 @@ final class VoiceboxClient {
     /// polling, discovered on first use.
     private var cachedPollTemplate: String?
 
+    /// Engines learned from "profile X only supports engine 'Y'" errors,
+    /// keyed by profile id, so we only pay the failed round-trip once.
+    private var learnedEngines: [String: String] = [:]
+
     /// How long to wait for a render before giving up. First-time model
     /// loads can take a while.
     private let generationTimeout: TimeInterval = 300
@@ -117,7 +121,27 @@ final class VoiceboxClient {
     /// Renders `text` with the given profile and returns playable audio
     /// data (WAV). Handles both immediate-audio responses and Voicebox's
     /// job-based flow (create → poll status → download audio_path).
-    func generate(text: String, profileID: String?) async throws -> Data {
+    ///
+    /// Voicebox validates that the request's TTS `engine` matches the
+    /// profile's engine, so we pass the profile's engine when known and
+    /// self-correct from the server's error message when not.
+    func generate(text: String, profileID: String?, engine: String? = nil) async throws -> Data {
+        let effectiveEngine = engine ?? profileID.flatMap { learnedEngines[$0] }
+        do {
+            return try await submitGeneration(text: text, profileID: profileID, engine: effectiveEngine)
+        } catch ClientError.badResponse(let status, let body) {
+            // e.g. {"detail":"Preset profile … only supports engine 'kokoro', not 'qwen'"}
+            if status == 400,
+               let required = Self.requiredEngine(inErrorBody: body),
+               required != effectiveEngine {
+                if let profileID { learnedEngines[profileID] = required }
+                return try await submitGeneration(text: text, profileID: profileID, engine: required)
+            }
+            throw ClientError.badResponse(status: status, body: body)
+        }
+    }
+
+    private func submitGeneration(text: String, profileID: String?, engine: String?) async throws -> Data {
         let url = baseURL.appendingPathComponent("generate")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -131,6 +155,9 @@ final class VoiceboxClient {
             body["profile_id"] = profileID
             body["profileId"] = profileID
             body["profile"] = profileID
+        }
+        if let engine, !engine.isEmpty {
+            body["engine"] = engine
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -373,6 +400,21 @@ final class VoiceboxClient {
     }
 
     // MARK: - Helpers
+
+    /// Extracts the engine name from errors like
+    /// "Preset profile … only supports engine 'kokoro', not 'qwen'".
+    private static func requiredEngine(inErrorBody body: String) -> String? {
+        for pattern in ["supports engine '([^']+)'", "requires engine '([^']+)'"] {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+               let match = regex.firstMatch(in: body, options: [],
+                                            range: NSRange(body.startIndex..., in: body)),
+               match.numberOfRanges > 1,
+               let range = Range(match.range(at: 1), in: body) {
+                return String(body[range])
+            }
+        }
+        return nil
+    }
 
     /// A human-readable failure if the record reports one.
     private static func failureMessage(in record: [String: Any]) -> String? {

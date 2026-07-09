@@ -32,6 +32,7 @@ final class AudioExporter {
         case .voicebox:
             exportViaVoicebox(text: text,
                               profileID: player.voiceboxProfileID,
+                              engine: player.voiceboxProfileEngine,
                               to: destination,
                               completion: completion)
         case .system:
@@ -47,6 +48,7 @@ final class AudioExporter {
     /// the clips into a single WAV file. Runs at natural (1x) speed.
     static func exportViaVoicebox(text: String,
                                   profileID: String?,
+                                  engine: String?,
                                   to destination: URL,
                                   completion: @escaping (Result<URL, Error>) -> Void) {
         let sentences = SpeechPlayer.sentenceRanges(in: text)
@@ -57,7 +59,7 @@ final class AudioExporter {
                 var outputFile: AVAudioFile?
                 for range in sentences {
                     let sentence = ns.substring(with: range)
-                    let data = try await VoiceboxClient.shared.generate(text: sentence, profileID: profileID)
+                    let data = try await VoiceboxClient.shared.generate(text: sentence, profileID: profileID, engine: engine)
                     let buffer = try Self.pcmBuffer(from: data)
                     if outputFile == nil {
                         outputFile = try AVAudioFile(forWriting: destination,
